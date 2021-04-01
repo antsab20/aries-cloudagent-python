@@ -3,9 +3,17 @@ import json
 import logging
 import os
 import sys
+import random
+
+from datetime import date
+from uuid import uuid4
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # noqa
 
+from runners.agent_container import (
+    create_agent_with_args,
+    arg_parser,
+)
 from runners.support.agent import DemoAgent, default_genesis_txns  # noqa:E402
 from runners.support.utils import (  # noqa:E402
     log_msg,
@@ -18,6 +26,10 @@ from runners.support.utils import (  # noqa:E402
 
 LOGGER = logging.getLogger(__name__)
 
+
+CRED_PREVIEW_TYPE = "https://didcomm.org/issue-credential/2.0/credential-preview"
+SELF_ATTESTED = os.getenv("SELF_ATTESTED")
+TAILS_FILE_COUNT = int(os.getenv("TAILS_FILE_COUNT", 100))
 
 class AcmeAgent(DemoAgent):
     def __init__(self, http_port: int, admin_port: int, **kwargs):
@@ -52,8 +64,8 @@ class AcmeAgent(DemoAgent):
             self.connection_id = conn_id
         if conn_id == self.connection_id:
             if (
-                message["rfc23_state"] in ["completed", "response-sent"]
-                and not self._connection_ready.done()
+                    message["rfc23_state"] in ["completed", "response-sent"]
+                    and not self._connection_ready.done()
             ):
                 self.log("Connected")
                 self._connection_ready.set_result(True)
@@ -70,7 +82,10 @@ class AcmeAgent(DemoAgent):
 
         if state == "request-received":
             # TODO issue credentials based on offer preview in cred ex record
-            pass
+            await self.admin_POST(
+                f"/issue-credential-2.0/records/{cred_ex_id}/issue",
+                {"comment": f"Issuing credential, exchange {cred_ex_id}"},
+            )
 
     async def handle_issue_credential_v2_0_indy(self, message):
         pass  # employee id schema does not support revocation
@@ -81,8 +96,18 @@ class AcmeAgent(DemoAgent):
         self.log(f"Presentation: state = {state}, pres_ex_id = {pres_ex_id}")
 
         if state == "presentation-received":
-            # TODO handle received presentations
-            pass
+            state = message["state"]
+            pres_ex_id = message["pres_ex_id"]
+            self.log(f"Presentation: state = {state}, pres_ex_id = {pres_ex_id}")
+
+            if state == "presentation-received":
+                log_status("#27 Process the proof provided by X")
+                log_status("#28 Check if proof is valid")
+                proof = await self.admin_POST(
+                    f"/present-proof-2.0/records/{pres_ex_id}/verify-presentation"
+                )
+                self.log("Proof =", proof["verified"])
+                print(proof)
 
     async def handle_basicmessages(self, message):
         self.log("Received message:", message["content"])
@@ -113,23 +138,21 @@ async def main(start_port: int, show_timing: bool = False):
         # Create a schema
         log_status("#3 Create a new schema on the ledger")
         with log_timer("Publish schema and cred def duration:"):
-            pass
-            # TODO define schema
-            # version = format(
-            #     "%d.%d.%d"
-            #      % (
-            #         random.randint(1, 101),
-            #         random.randint(1, 101),
-            #         random.randint(1, 101),
-            #     )
-            # )
-            # (schema_id, cred_def_id) = await agent.register_schema_and_creddef(
-            #     "employee id schema",
-            #     version,
-            #     ["employee_id", "name", "date", "position"],
-            #     support_revocation=False,
-            #     revocation_registry_size=TAILS_FILE_COUNT,
-            # )
+            version = format(
+                "%d.%d.%d"
+                % (
+                    random.randint(1, 101),
+                    random.randint(1, 101),
+                    random.randint(1, 101),
+                )
+            )
+            (schema_id, cred_def_id) = await agent.register_schema_and_creddef(
+                "employee id schema",
+                version,
+                ["employee_id", "name", "date", "position"],
+                support_revocation=False,
+                revocation_registry_size=TAILS_FILE_COUNT,
+            )
 
         with log_timer("Generate invitation duration:"):
             # Generate an invitation
@@ -150,8 +173,8 @@ async def main(start_port: int, show_timing: bool = False):
         await agent.detect_connection()
 
         async for option in prompt_loop(
-            "(1) Issue Credential, (2) Send Proof Request, "
-            + "(3) Send Message (X) Exit? [1/2/3/X] "
+                "(1) Issue Credential, (2) Send Proof Request, "
+                + "(3) Send Message (X) Exit? [1/2/3/X] "
         ):
             option = option.strip()
             if option in "xX":
@@ -160,10 +183,83 @@ async def main(start_port: int, show_timing: bool = False):
             elif option == "1":
                 log_status("#13 Issue credential offer to X")
                 # TODO credential offers
+                agent.cred_attrs[cred_def_id] = {
+                    "employee_id": "ACME0009",
+                    "name": "Alice Smith",
+                    "date": date.isoformat(date.today()),
+                    "position": "CEO"
+                }
 
+                cred_preview = {
+                    "@type": CRED_PREVIEW_TYPE,
+                    "attributes": [
+                        {"name": n, "value": v}
+                        for (n, v) in agent.cred_attrs[
+                            cred_def_id
+                        ].items()
+                    ],
+                }
+                offer_request = {
+                    "connection_id": agent.connection_id,
+                    "comment": f"Offer on cred def id {cred_def_id}",
+                    "auto_remove": False,
+                    "credential_preview": cred_preview,
+                    "filter": {"indy": {"cred_def_id": cred_def_id}}
+                }
+                await agent.admin_POST(
+                    "/issue-credential-2.0/send-offer", offer_request
+                )
             elif option == "2":
                 log_status("#20 Request proof of degree from alice")
                 # TODO presentation requests
+                faber_schema_name = "degree schema"
+                req_attrs = [
+                    {
+                        "name": "name",
+                        "restrictions": [{"schema_name": faber_schema_name}],
+                    },
+                    {
+                        "name": "date",
+                        "restrictions": [{"schema_name": faber_schema_name}],
+                    },
+                    {
+                        "name": "degree",
+                        "restrictions": [{"schema_name": faber_schema_name}],
+                    }
+                ]
+
+                req_preds = [
+                    # test zero-knowledge proofs
+                    {
+                        "name": "age",
+                        "p_type": ">=",
+                        "p_value": 18,
+                        "restrictions": [{"schema_name": faber_schema_name}],
+                    }
+                ]
+
+                indy_proof_request = {
+                    "name": "Proof of Education",
+                    "version": "1.0",
+                    "requested_attributes": {
+                        f"0_{req_attr['name']}_uuid": req_attr for req_attr in req_attrs
+                    },
+                    "requested_predicates": {
+                        f"0_{req_pred['name']}_GE_uuid": req_pred
+                        for req_pred in req_preds
+                    },
+                }
+
+                proof_request_web_request = {
+                    "connection_id": agent.connection_id,
+                    "presentation_request": {"indy": indy_proof_request}
+                }
+                # this sends the request to our agent, which forwards it to Alice
+                # (based on the connection_id)
+
+                await agent.admin_POST(
+                    "/present-proof-2.0/send-request", proof_request_web_request
+                )
 
             elif option == "3":
                 msg = await prompt("Enter message: ")
